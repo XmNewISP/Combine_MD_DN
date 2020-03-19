@@ -1,20 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
+import sys
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms.functional as tvF
 import numpy as np
+import time
+from PIL import Image
+import cv2
 from argparse import ArgumentParser
 
-from ..movedetect-pytorch.src.unet import MdNet
-from ..noise2noise-pytorch.src.unet import UNet
+from net import MdNet,UNet
 use_cuda = torch.cuda.is_available()
 
-#±ØĞëºÍMdNetµÄ²ÎÊı±£³ÖÒ»ÖÂ
+#å¿…é¡»å’ŒMdNetçš„å‚æ•°ä¿æŒä¸€è‡´
 MD_NET_STRIDE = 8
 MD_NET_RECEPTIVE_FIELD = 32
+
+#é™å™ªä¸­é—´çŠ¶æ€
+denoise_status_image = None
+
+#è°ƒè¯•æ ‡å¿—
+DEBUG_DEFINE = 1
 
 def parse_args():
     """Command-line argument parser for testing."""
@@ -29,10 +38,22 @@ def parse_args():
     parser.add_argument('--n2n-ckpt', help='load md model checkpoint')    
     return parser.parse_args()
 
-#ÊäÈëÍ¼Æ¬,·µ»Ømask
-def do_movedetect(model,oldframe,newframe):
+#https://blog.csdn.net/weixin_39128119/article/details/84172385
+#å¯¹maskå›¾åƒè¿›è¡Œè†¨èƒ€æ“ä½œ
+def do_dilate(mask):
+    #Imageè½¬cv
+    mask = np.array(mask)
+    #è®¾ç½®å·ç§¯æ ¸5*5
+    kernel = np.ones((8,8),np.uint8)
+    #å›¾åƒçš„è†¨èƒ€-è†¨èƒ€
+    mask = cv2.dilate(mask,None,iterations=5)
+    #cvè½¬Image
+    return Image.fromarray(mask) 
+
+#è¾“å…¥å›¾ç‰‡,è¿”å›mask
+def do_movedetect(model,oldframe,curframe):
     oldT = tvF.to_tensor(oldframe).unsqueeze(0)
-    newT = tvF.to_tensor(newframe).unsqueeze(0)
+    newT = tvF.to_tensor(curframe).unsqueeze(0)
     if use_cuda:
         oldT = oldT.cuda()
         newT = newT.cuda()
@@ -40,22 +61,22 @@ def do_movedetect(model,oldframe,newframe):
     output = model(input).detach()
     result = F.softmax(output, dim=1).squeeze(0).detach().cpu()
     md_fmap = tvF.to_pil_image(result[1])
-    #·Å´óµ½Ô­Í¼:ÓĞ¼¼ÇÉ¡¶Ñ§Ï°±Ê¼Ç:¹ØÓÚ¸ĞÊÜÒ°¡·
+    #æ”¾å¤§åˆ°åŸå›¾:æœ‰æŠ€å·§ã€Šå­¦ä¹ ç¬”è®°:å…³äºæ„Ÿå—é‡ã€‹
     image_box_x1 = MD_NET_RECEPTIVE_FIELD//2
     image_box_y1 = MD_NET_RECEPTIVE_FIELD//2
     image_box_x2 = (md_fmap.size[0]-1)*MD_NET_STRIDE+MD_NET_RECEPTIVE_FIELD//2
     image_box_y2 = (md_fmap.size[1]-1)*MD_NET_STRIDE+MD_NET_RECEPTIVE_FIELD//2
-    #Ö»ÊÇÖĞ¼äÓĞĞ§²¿·Ö
+    #åªæ˜¯ä¸­é—´æœ‰æ•ˆéƒ¨åˆ†
     rsz_w = image_box_x2-image_box_x1+1
     rsz_h = image_box_y2-image_box_y1+1
     md_rsz = md_fmap.resize((rsz_w,rsz_h))
-    #²¹È«ËÄÖÜ£¬µÃµ½Ô­Í¼µÄmask
-    md_mask  = Image.new("L",(img.size))
+    #è¡¥å…¨å››å‘¨ï¼Œå¾—åˆ°åŸå›¾çš„mask
+    md_mask  = Image.new("L",(curframe.size))
     md_mask.paste(md_rsz,(image_box_x1,image_box_y1))
     return md_mask
     
 def do_noise2noise(model,frame):
-    #UnetµÄÉè¼Æµ¼ÖÂÒª32¶ÔÆë
+    #Unetçš„è®¾è®¡å¯¼è‡´è¦32å¯¹é½
     w, h = frame.size   
     if w % 32 != 0:
         w = (w//32)*32
@@ -71,46 +92,65 @@ def do_noise2noise(model,frame):
     denoised = denoised.cpu()
     denoised = denoised.squeeze(0)
     denoised = tvF.to_pil_image(denoised)
-    #ÌùºÏÔ­Í¼´óĞ¡
+    #è´´åˆåŸå›¾å¤§å°
     frame.paste(denoised,(0, 0))
     return frame
 
-#½µÔëÖĞ¼ä×´Ì¬
-MD_THRESHOLD[3] = [32,64,96]          #
-TIME_FILTER[3] = [0.99,0.95,0.90]     #0.95Ïàµ±ÓÚÀúÊ·20Ö¡µÄ¼ÓÈ¨»¬¶¯Æ½¾ù
-denoise_status_image = None 
 def do_combine(mdMask,noiseFrame,denoisedFrame):
+    print("do_combine-------->")
     global denoise_status_image
-    if denoise_status_image == None:
+    if denoise_status_image is None:
         print(mdMask.size)
-        denoise_status_image = np.array(denoisedFrame)
-        print(denoise_status_image.shape)
+        denoise_status_image = np.array(denoisedFrame,dtype=np.float32)
+        print(denoise_status_image.shape)   #HWC
+        print(denoise_status_image.dtype)
     
-    #¸ù¾İ¶¯¼ì½á¹û½øĞĞÈÚºÏ
-    w,h = mdMask.size
-    for i in range(h):
-        for j in range(w):
-            mdScore = mdMask.getpixel((i,j))
-            if(mdScore<MD_THRESHOLD[0]):  #¾²Ö¹_0
-                val = noiseFrame.getpixel((i,j)) #RGB
-                denoise_status_image[i,j] = \
-                denoise_status_image[i,j]*TIME_FILTER[0] + val*(1-TIME_FILTER[0])
-            elif(mdScore<MD_THRESHOLD[1]):  #¾²Ö¹_1
-                val = noiseFrame.getpixel((i,j)) #RGB
-                denoise_status_image[i,j] = \
-                denoise_status_image[i,j]*TIME_FILTER[1] + val*(1-TIME_FILTER[1])
-            elif(mdScore<MD_THRESHOLD[2]):  #¾²Ö¹_2
-                val = noiseFrame.getpixel((i,j)) #RGB
-                denoise_status_image[i,j] = \
-                denoise_status_image[i,j]*TIME_FILTER[2] + val*(1-TIME_FILTER[2])
-            else:   #ÔË¶¯,ÒÔ2D½µÔëÎª×¼
-                val = denoisedFrame.getpixel((i,j))
-                denoise_status_image[i,j] = val
-    denoise_status_image = np.array(denoisedFrame)
-    print("denoise_status_image.dtype=",denoise_status_image.dtype)
+    #æ ¹æ®åŠ¨æ£€ç»“æœè¿›è¡Œèåˆ
+    width,height = mdMask.size
+    for y in range(height):
+        for x in range(width):
+            mdScore = mdMask.getpixel((x,y))
+            if(mdScore<=64):  #é™æ­¢_0
+                val = noiseFrame.getpixel((x,y)) #RGB
+                denoise_status_image[y,x] = \
+                denoise_status_image[y,x]*0.90 + np.array(val)*(1-0.90)
+            else:   #è¿åŠ¨,ä»¥2Dé™å™ªä¸ºå‡†
+                val = denoisedFrame.getpixel((x,y))
+                denoise_status_image[y,x] = np.array(val)
     out = denoise_status_image.astype(np.uint8)
+    print("do_combine-------->finish")
     return tvF.to_pil_image(out)
-
+    
+def do_combine_fast(mdMask,noiseFrame,denoisedFrame):
+    print("do_combine_fast-------->")
+    global denoise_status_image
+    if denoise_status_image is None:
+        print(mdMask.size)
+        denoise_status_image = np.array(denoisedFrame,dtype=np.float32)
+        print(denoise_status_image.shape)   #HWC
+        print(denoise_status_image.dtype)
+    #æ ¹æ®åŠ¨æ£€ç»“æœè¿›è¡Œèåˆ
+    mask = np.array(mdMask)
+    mask_bd = np.zeros_like(noiseFrame)
+    print("mask_bd.dtype--->",mask_bd.dtype)
+    mask_bd[:,:,0] = mask
+    mask_bd[:,:,1] = mask
+    mask_bd[:,:,2] = mask
+    noiseFrame = np.array(noiseFrame)
+    denoisedFrame = np.array(denoisedFrame)
+    print("denoisedFrame.dtype--->",denoisedFrame.dtype)    
+    #äºŒå€¼åŒ–
+    static_mask = 1*(mask_bd <= 64)
+    dynmic_mask = 1-static_mask
+    #print(static_mask)            
+    #print(dynmic_mask)        
+    denoise_status_image = denoise_status_image*0.90 + (1-0.90)*static_mask*noiseFrame
+    denoise_status_image = denoise_status_image*static_mask + dynmic_mask*denoisedFrame    
+    #è½¬Image
+    out = denoise_status_image.astype(np.uint8)
+    print("do_combine_fast-------->finish")
+    return tvF.to_pil_image(out)
+    
 if __name__ == '__main__':
     # Parse test parameters
     params = parse_args()
@@ -128,18 +168,19 @@ if __name__ == '__main__':
         md_model.load_state_dict(torch.load(params.md_ckpt, map_location='cpu'))
         n2n_model.load_state_dict(torch.load(params.n2n_ckpt, map_location='cpu'))
     n2n_model.train(False)
-
-    #´¦ÀíÃ¿Ò»ÕÅÍ¼Æ¬
-    save_path = os.path.dirname(self.p.result)
+    
+    #å¤„ç†æ¯ä¸€å¼ å›¾ç‰‡
+    save_path = os.path.dirname(params.result)
     if not os.path.isdir(save_path):
         os.mkdir(save_path)
-    input_path = self.p.data
-    namelist = os.listdir(input_path)
-    namelist.sort()
-    print(namelist)
-    img_path = os.path.join(input_path,name)
+    input_path = params.data
+    namelist = [name for name in os.listdir(input_path) if name!="groundtruth.jpg"]
+    namelist.sort(key=lambda x:int(x.replace(".jpg","")))
+    #print(namelist)
+    
     for a,b in zip(range(0,len(namelist)-1),range(1,len(namelist))):
         print(a,b)
+        print(namelist[a],namelist[b])
         imgA_path = os.path.join(input_path,namelist[a])
         imgB_path = os.path.join(input_path,namelist[b])
         imgA = Image.open(imgA_path).convert('RGB')
@@ -147,12 +188,24 @@ if __name__ == '__main__':
         print(imgA_path,imgB_path)
         print(imgA.size)
         assert(imgA.size == imgB.size)
-        #ÏÈ×ö¶¯¼ì
+        #å…ˆåšåŠ¨æ£€
         md_mask = do_movedetect(md_model,imgA,imgB)
-        #ÔÙ×öÈ¥Ôë
+        if DEBUG_DEFINE :  #è°ƒè¯•ä¿¡æ¯è¾“å‡º
+            md_red_label = Image.new("RGB",(imgB.size),(255,0,0))          
+            md_red = Image.composite(md_red_label,imgB,md_mask)
+            md_red.save(os.path.join(save_path, f'{namelist[b]}-md.jpg'))
+        #å¯¹maskè¿›è¡Œè†¨èƒ€,å¡«è¡¥ç©ºæ´
+        dilate_mask = do_dilate(md_mask)   
+        if DEBUG_DEFINE :  #è°ƒè¯•ä¿¡æ¯è¾“å‡º
+            dilate_red = Image.composite(md_red_label,imgB,dilate_mask)
+            dilate_red.save(os.path.join(save_path, f'{namelist[b]}-dilate.jpg'))
+        #å†åšå»å™ª
         dn_imgB = do_noise2noise(n2n_model,imgB)
-        #ÔÙ½øĞĞÈÚºÏ
-        out = do_combine(md_mask,imgB,dn_imgB)
-        #print(md_red.size)
-        fname = os.path.basename(imgB_path)
-        out.save(os.path.join(save_path, f'{fname}_dn.jpg'))
+        if DEBUG_DEFINE :  #è°ƒè¯•ä¿¡æ¯è¾“å‡º
+            dn_imgB.save(os.path.join(save_path, f'{namelist[b]}-dn.jpg'))
+        #å†è¿›è¡Œèåˆ
+        #out1 = do_combine(dilate_mask,imgB,dn_imgB)
+        #out1.save(os.path.join(save_path, f'{namelist[b]}_ok1.jpg'))
+        out2 = do_combine_fast(dilate_mask,imgB,dn_imgB)
+        out2.save(os.path.join(save_path, f'{namelist[b]}_ok2.jpg'))
+        #exit(0)
