@@ -4,6 +4,36 @@
 import torch
 import torch.nn as nn
 
+#简易动检网络
+class MdSimpleNet(nn.Module):    
+    def __init__(self):
+        """Initializes U-Net."""
+        super(MdSimpleNet, self).__init__()
+
+    def forward(self,xset,pool_kernel,pool_stride,threshold):
+        print("MdSimpleNet forward--->xset.size",xset.size())
+        #滑窗求均值
+        xset = nn.AvgPool2d(pool_kernel,pool_stride)(xset)
+        #按通道进行分割
+        x_list = torch.split(xset,1,dim=1)
+        #求两帧的绝对差
+        diffs = None
+        x = x_list[0]
+        for x_other in x_list[1:] :
+            if diffs is None:
+                diffs = torch.abs(x-x_other)
+            else:
+                diff = torch.abs(x-x_other)
+                diffs = torch.cat((diffs,diff),1)
+        print("MdSimpleNet forward--->diffs.size",diffs.size())
+        #按通道求最值
+        max_diff,_ = torch.max(diffs,1)
+        print("MdSimpleNet forward--->max_diff.size",max_diff.size())
+        #运动判断
+        out = torch.ge(max_diff, threshold)
+        print("MdSimpleNet forward--->out.size",out.size())
+        return out.float()
+
 class MdNet(nn.Module):
     """Custom U-Net architecture for Noise2Noise (see Appendix, Table 2)."""
     
@@ -13,18 +43,18 @@ class MdNet(nn.Module):
         super(MdNet, self).__init__()
         #
         self.net = nn.Sequential(               #32
-            nn.Conv2d(in_channels, 32, 3),      #30
+            nn.Conv2d(in_channels, 128, 3),      #30
             nn.ReLU(inplace=True),
             nn.MaxPool2d(2),                    #15
-            nn.Conv2d(32, 64, 2),               #14
+            nn.Conv2d(128, 256, 2),               #14
             nn.ReLU(inplace=True),
             nn.MaxPool2d(2),                    #7
-            nn.Conv2d(64, 128, 2),              #6
+            nn.Conv2d(256, 512, 2),              #6
             nn.ReLU(inplace=True),      
             nn.MaxPool2d(2),                    #3
-            nn.Conv2d(128, 128, 2),             #2
+            nn.Conv2d(512, 1024, 2),             #2
             nn.ReLU(inplace=True),              
-            nn.Conv2d(128, out_channels, 2))    #1
+            nn.Conv2d(1024, out_channels, 2))    #1
         # Initialize weights
         self._init_weights()
 
